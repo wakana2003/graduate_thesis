@@ -235,80 +235,99 @@ cfg <- list(
   alphas     = c(0.1,0.5,0.9),
   betas      = c(1.0,1.9)
 )
-
+```
+```{r seltutei}
 cfg_ev <- cfg
 cfg_ev$n_agents <- 5000
 
-plot_habit_grid <- function(cfg, root) {
-  agent_type <- cfg$agent_type
-  T_val      <- cfg$T_val
-  r_base     <- cfg$r_base
-  n_agents   <- cfg$n_agents
-  rep_idx    <- cfg$rep_idx
-  alphas     <- cfg$alphas
-  betas      <- cfg$betas
-
-  fstr    <- function(x) gsub("\\.", "-", sprintf("%.1f", x))
-  t_label <- "pna"
-
-  base_dir <- file.path(
-    root,
-    sprintf("T%s_r%s_%sagents_rep%s",
-            fstr(T_val),
-            paste(r_base, collapse = "-"),
-            n_agents,
-            rep_idx),
-    "png"
-  )
-
-  grid.newpage()
-  pushViewport(viewport(layout = grid.layout(
-    nrow = 4, ncol = 3,
-    heights = unit(c(1, rep(1,3)), c("lines","null","null","null"))
-  )))
-
-  idx <- 1
-  for (α in alphas) {
-    for (β in betas) {
-      row <- ceiling(idx / 3) + 1
-      col <- if (idx %% 3 == 0) 3 else idx %% 3
-
-      pushViewport(viewport(layout.pos.row = row, layout.pos.col = col))
-
-      fn <- file.path(
-        base_dir,
-        sprintf("%s_%s_a%s_b%s.png",
-                agent_type, t_label,
-                fstr(α), fstr(β))
-      )
-
-      if (file.exists(fn)) {
-        grid.raster(readPNG(fn),
-                    width  = unit(1, "npc"),
-                    height = unit(1, "npc"))
-      } else {
-        grid.rect(gp = gpar(fill = "gray90", col = NA))
-        grid.text(basename(fn), gp = gpar(fontsize = 8))
+plot_overlay_pA_grid <- function(cfg_list, label_list, root_list = c("data", "expected_value")) {
+  fstr <- function(x) gsub("\\.", "-", sprintf("%.1f", x))
+  
+  df_all_total <- list()
+  
+  for (i in seq_along(cfg_list)) {
+    cfg      <- cfg_list[[i]]
+    label    <- label_list[[i]]
+    root     <- root_list[[i]]
+    
+    folder   <- sprintf("T%s_r%s_%sagents_rep%s",
+                        fstr(cfg$T_val),
+                        paste(cfg$r_base, collapse = "-"),
+                        cfg$n_agents,
+                        cfg$rep_idx)
+    csv_dir  <- file.path(root, folder, "csv")
+    agent_cli <- cfg$agent_type
+    
+    df_list <- list()
+    
+    for (alpha in cfg$alphas) {
+      for (beta in cfg$betas) {
+        t_label <- paste0("p", fstr(cfg$extra_p))
+        fname   <- sprintf("%s_%s_a%s_b%s_pA.csv",
+                           agent_cli, t_label,
+                           fstr(alpha), fstr(beta))
+        fpath   <- file.path(csv_dir, fname)
+        
+        if (file.exists(fpath)) {
+          df <- readr::read_csv(fpath, show_col_types = FALSE) %>%
+            dplyr::mutate(
+              alpha = alpha,
+              beta  = beta,
+              sample_size = label
+            )
+          df_list[[length(df_list) + 1]] <- df
+        } else {
+          warning("ファイルが存在しません: ", fpath)
+        }
       }
-
-      popViewport()
-      idx <- idx + 1
     }
+    
+    df_all_total[[i]] <- dplyr::bind_rows(df_list)
   }
+  
+  df_pA_all <- dplyr::bind_rows(df_all_total) %>%
+    dplyr::mutate(
+      alpha = factor(alpha, levels = sort(unique(cfg_list[[1]]$alphas))),
+      beta  = factor(beta,  levels = sort(unique(cfg_list[[1]]$betas))),
+      sample_size = factor(sample_size, levels = label_list)
+    )
+  
+    ggplot2::ggplot(df_pA_all, ggplot2::aes(x = trial, y = pA,
+                                          color = sample_size,
+                                          group = interaction(sample_size, alpha, beta))) +
+    ggplot2::geom_line(linewidth = 0.8) +
+    ggplot2::facet_grid(alpha ~ beta,
+                        labeller = ggplot2::label_both,
+                        switch = "y") +
+    ggplot2::coord_cartesian(ylim = c(0, 1)) +
+    ggplot2::theme_minimal(base_size = 13) +
+    ggplot2::theme(
+      strip.placement   = "outside",
+      strip.text.y.left = ggplot2::element_text(angle = 0),
+      panel.grid.minor  = ggplot2::element_blank()
+    ) +
+    ggplot2::scale_color_manual(
+      values = c("n=50" = "#FDB863",  
+                 "n=5000" = "#E66101")
+    ) +
+    ggplot2::labs(
+      title = " Aの選択確率　p(A)",
+      x     = "試行",
+      y     = "p(A)",
+      color = "人数"
+    )
 
-  popViewport()
 }
 
 ```
 
 ### 3.3.1 50人のデータ
 ```{r hyouzi}
-plot_habit_grid(cfg, "data")
-```
-
-### 3.3.2 5000人のデータ
-```{r hyouzi2}
-plot_habit_grid(cfg_ev, "expected_value")
+plot_overlay_pA_grid(
+  cfg_list   = list(cfg, cfg_ev),
+  label_list = c("n=50", "n=5000"),
+  root_list  = c("data", "expected_value")
+)
 ```
 
 # 4.フィッティング
@@ -318,15 +337,16 @@ plot_habit_grid(cfg_ev, "expected_value")
 stanファイルは以下を使用した
 
 ### 4.1.1 normal_2_2.stan
+
 \[
 \begin{aligned}
 \alpha &\sim \mathrm{Beta}(2, 2) \\
-\beta &\sim \mathrm{LogNormal}(\log 1,\, 0.5) \\
-Q_{\text{init},1} &\sim \mathcal{N}(2, 2) \\
-Q_{\text{init},2} &\sim \mathcal{N}(2, 2) \\
-r_{\text{int}} &\sim \mathcal{N}(2, 2)
+\beta  &\sim \mathrm{LogNormal}(\log 1,\,0.5) \\
+Q_{\mathrm{init},1} &\sim \mathcal{N}(3.75,\,2)\;T[0,7.5] \\
+Q_{\mathrm{init},2} &= 0
 \end{aligned}
 \]
+
 
 ```
 data {
@@ -338,22 +358,22 @@ data {
 }
 
 parameters {
-  real<lower=0, upper=1> alpha;
-  real<lower=0> beta;
-  real Q_init1;
-  real Q_init2;
-  real r_int;
+  real<lower=0, upper=1> alpha;   
+  real<lower=0>          beta;    
+  real                   Q_init1; 
+}
+
+transformed parameters {
+  real Q_init2 = 0;               
 }
 
 model {
-  alpha ~ beta(2, 2);
-  beta ~ lognormal(log(1), 0.5);
-  Q_init1 ~ normal(2, 2);
-  Q_init2 ~ normal(2, 2);
-  r_int ~ normal(2, 2);
+  alpha   ~ beta(2, 2);
+  beta    ~ lognormal(log(1), 0.5);
+  Q_init1 ~ normal(3.75, 2) T[0, 7.5];
 
   for (n in 1:N) {
-    vector[2] Q;
+    vector[2] Q = rep_vector(0.0, 2);
     Q[1] = Q_init1;
     Q[2] = Q_init2;
 
@@ -362,32 +382,33 @@ model {
       choice[n, t] ~ bernoulli(pA);
 
       int a = choice[n, t] + 1;
-      real r = (a == 1) ? reward_A[n, t] + r_int : reward_B[n, t];
+      real r = (a == 1) ? reward_A[n, t] : reward_B[n, t];
       Q[a] += alpha * (r - Q[a]);
     }
   }
 }
 
 generated quantities {
-  array[N, T] int<lower=0, upper=1> choice_rep;
-  array[N, T] real pA_track;
+  array[N, T] int<lower=0,upper=1> choice_rep;
+  array[N, T] real              pA_track;
 
   for (n in 1:N) {
-    vector[2] Q;
+    vector[2] Q = rep_vector(0.0, 2);
     Q[1] = Q_init1;
     Q[2] = Q_init2;
 
     for (t in 1:T) {
       real pA = inv_logit(beta * (Q[1] - Q[2]));
-      pA_track[n, t] = pA;
+      pA_track[n, t]   = pA;
       choice_rep[n, t] = bernoulli_rng(pA);
 
       int a = choice_rep[n, t] + 1;
-      real r = (a == 1) ? reward_A[n, t] + r_int : reward_B[n, t];
+      real r = (a == 1) ? reward_A[n, t] : reward_B[n, t];
       Q[a] += alpha * (r - Q[a]);
     }
   }
 }
+
 ```
 
 ## 4.2 フィッティングの実行
@@ -408,7 +429,7 @@ param_grid <- expand.grid(
     key   = paste0("a", a_str, "_b", b_str)  
   )
 
-fit_model <- function(cfg, alpha, beta, stan_file = "normal_2_2_habit.stan") {
+fit_model <- function(cfg, alpha, beta, stan_file = "first_value.stan") {
 
   fmt_dash <- function(x) gsub("\\.", "-", sprintf("%.1f", x))
   join_dash <- function(v) paste(v, collapse = "-")
@@ -464,7 +485,7 @@ names(fit_list) <- param_grid$key
 ```{r summary}
 alpha_beta_summary <- imap_dfr(
   fit_list,
-  ~ .x$summary(variables = c("alpha", "beta")) %>%
+  ~ .x$summary(variables = c("alpha", "beta","Q_init1")) %>%
       as_tibble() %>%
       mutate(pattern = .y) %>%                      
       select(
@@ -497,7 +518,7 @@ knitr::kable(
 
 5.1.1.1 データの読み込み
 ```{r yomikomi1, cache=FALSE}
-param_list <- c("alpha", "beta")
+param_list <- c("alpha", "beta","Q_init1")
 
 plot_trace_facet <- function(param_name, fit_list) {
   trace_df <- dplyr::bind_rows(lapply(names(fit_list), function(model) {
@@ -514,7 +535,7 @@ plot_trace_facet <- function(param_name, fit_list) {
   
   ggplot2::ggplot(trace_df, ggplot2::aes(x = iteration, y = value, color = chain)) +
     ggplot2::geom_line(alpha = 0.8) +
-    ggplot2::facet_wrap(~model, ncol = 3) +
+    ggplot2::facet_wrap(~model, ncol = 2) +
     ggplot2::labs(title = paste("Traceplot of", param_name),
                   x = "Iteration", y = param_name, color = "Chain") +
     ggplot2::theme_minimal()
@@ -529,6 +550,11 @@ plot_trace_facet("alpha", fit_list)
 #### 5.1.1.3 traceplot beta
 ```{r beta1,cache=FALSE}
 plot_trace_facet("beta", fit_list)
+```
+
+#### 5.1.1.4 traceplot Q_init1
+```{r Qinit1,cache=FALSE}
+plot_trace_facet("Q_init1", fit_list)
 ```
 
 ## 5.2事後分布
@@ -551,7 +577,7 @@ plot_density_facet <- function(param_name, fit_list, y_max = NULL) {
   
   p <- ggplot(dens_df, aes(x = value, color = chain, fill = chain)) +
     geom_density(alpha = 0.3) +
-    facet_wrap(~model, ncol = 3) +
+    facet_wrap(~model, ncol = 2) +
     labs(title = paste("Posterior distribution of", param_name),
          x = param_name, y = "Density", color = "Chain", fill = "Chain") +
     theme_minimal()
@@ -568,13 +594,19 @@ plot_density_facet <- function(param_name, fit_list, y_max = NULL) {
 
 #### 5.2.1.1 alpha
 ```{r zigoalpha1, cache=FALSE}
-plot_density_facet("alpha", fit_list, y_max = 10)
+plot_density_facet("alpha", fit_list, y_max = 50)
 ```
 
 #### 5.2.1.2 beta
 ```{r zigobeta1, cache=FALSE}
 plot_density_facet("beta", fit_list, y_max = 10)
 ``` 
+
+#### 5.2.1.3 Q_init1
+```{r zigoQ_init1, cache=FALSE}
+plot_density_facet("Q_init1", fit_list, y_max = 10)
+``` 
+
 
 ## 5.3 実際の選択確率
 
@@ -594,52 +626,46 @@ df_all <- list()
 
 for (alpha in cfg$alphas) {
   for (beta in cfg$betas) {
-    file_name <- sprintf("%s_pna_a%s_b%s_pA.csv",
-      cfg$agent_type,
+    t_label   <- paste0("p", fstr(cfg$extra_p))
+    file_name <- sprintf("%s_%s_a%s_b%s_pA.csv",
+      cfg$agent_type,  
+      t_label,
       fstr(alpha),
       fstr(beta)
     )
     file_path <- file.path(csv_dir, file_name)
-
     if (file.exists(file_path)) {
-      raw <- read_csv(file_path, show_col_types = FALSE)
-
-      df <- raw %>%
-        mutate(
-          alpha = alpha,
-          beta  = beta
-        )
-
-      df_all[[length(df_all) + 1]] <- df
+      raw <- readr::read_csv(file_path, show_col_types = FALSE)
+      df_all[[length(df_all) + 1]] <- raw %>%
+        dplyr::mutate(alpha = alpha, beta = beta)
     } else {
       warning("ファイルが存在しません: ", file_path)
     }
   }
 }
 
-df_pA_all <- bind_rows(df_all)
-
-df_pA_all <- df_pA_all %>%
-  mutate(
+df_pA_all <- dplyr::bind_rows(df_all) %>%
+  dplyr::mutate(
     alpha = factor(alpha, levels = sort(unique(cfg$alphas))),
     beta  = factor(beta,  levels = sort(unique(cfg$betas)))
   )
 
-ggplot(df_pA_all, aes(x = trial, y = pA, group = interaction(alpha, beta))) +
-  geom_line(color = "#1f77b4", linewidth = 0.7) +
-  facet_grid(alpha ~ beta, switch = "y", labeller = label_both) +
-  coord_cartesian(ylim = c(0, 1)) +
-  theme_minimal(base_size = 13) +
-  theme(
-    strip.placement = "outside",
-    strip.text.y.left = element_text(angle = 0),
-    panel.grid.minor = element_blank()
+ggplot2::ggplot(df_pA_all, ggplot2::aes(x = trial, y = pA, group = interaction(alpha, beta))) +
+  ggplot2::geom_line(color = "orange", linewidth = 0.7) +
+  ggplot2::facet_grid(alpha ~ beta, labeller = ggplot2::label_both, switch = "y") +
+  ggplot2::coord_cartesian(ylim = c(0, 1)) +
+  ggplot2::theme_minimal(base_size = 13) +
+  ggplot2::theme(
+    strip.placement   = "outside",
+    strip.text.y.left = ggplot2::element_text(angle = 0),
+    panel.grid.minor  = ggplot2::element_blank()
   ) +
-  labs(
+  ggplot2::labs(
     title = "全 α×β 条件における 平均選択確率 p(A)",
-    x = "試行",
-    y = "p(A)"
+    x     = "試行",
+    y     = "p(A)"
   )
+
 ```
 
 ## 5.4 事後予測プロット
@@ -682,8 +708,8 @@ df_ppc_all <- imap_dfr(fit_list, function(fit, pat) {
 
 ggplot(df_ppc_all, aes(trial, pA)) +
   geom_ribbon(aes(ymin = lower, ymax = upper),
-              fill = "#1f77b4", alpha = 0.2) +
-  geom_line(color = "#1f77b4", size = 0.7) +
+              fill = "orange", alpha = 0.2) +
+  geom_line(color = "orange", size = 0.7) +
   facet_grid(alpha ~ beta, labeller = label_both, switch = "y") +
   coord_cartesian(ylim = c(0,1)) +
   theme_minimal() +
@@ -710,13 +736,13 @@ ggplot() +
   geom_ribbon(
     data = df_ppc_all,
     aes(x = trial, ymin = lower, ymax = upper),
-    fill  = "#1f77b4", alpha = 0.2
+    fill  = "orange", alpha = 0.2
   ) +
 
   geom_line(
     data = df_ppc_all,
     aes(x = trial, y = pA),
-    color = "#1f77b4", size = 0.7
+    color = "orange", size = 0.7
   ) +
 
   geom_line(

@@ -1,0 +1,771 @@
+---
+title: "T0-7_r5-5-0-18_50agents"
+
+author: "Hirasawa Wakana"
+date: "2025-07-07"
+output: 
+  html_document:
+    toc: true         
+    toc_depth: 3     
+    toc_float: true 
+abstract: 強化学習エージェントから生成された行動データに対して、フルモデルをフィッティングして、パラメータがうまく推定されているかを確認した。
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(gridExtra)
+library(cmdstanr)
+library(posterior)
+library(knitr)
+library(ggplot2)
+library(bayesplot) 
+library(stringr)
+library(tools)
+library(fs)
+library(glue)
+library(png)
+library(grid)
+library(purrr)
+library(dplyr)
+
+knitr::opts_chunk$set(
+  echo     = TRUE,
+  fig.path = "figure-html2/",  
+  fig.keep = "all",          
+  dev      = "png"
+)
+```
+
+# 1.目的
+
+### 1.1【大きい目的】
+
+人間が社会規範に従うメカニズムを明らかにする
+
+そのために、既存の複数の理論が提案する「規範遵守のメカニズム」が、互いにどのように異なり、どのように識別可能であるかを明らかにしたい
+
+
+### 1.2【中ぐらいの目的】
+
+フィッティング（パラメータリカバリー）を行うことで以下のことを確認する
+
+強化学習エージェントから生成された行動データに対して、それぞれの強化学習モデルをフィッティングして、パラメータがうまく推定されているかを確認する
+
+たとえば学習率 = 0.6、 逆温度 = 0.2という値の下で生成されたデータに、モデルをフィッティングしたとき、この2つの値が推定されないならば、モデルフィッティングがあまりうまくいかないことを意味する
+
+### 1.3【小さい目的】
+
+課題ごとでフィッティング結果にどのような違いがあるかを確認する。
+
+# 2.課題設定
+
+t0では、行動A（規範的な行動）を確率P(A)で、行動B（非規範的な行動）を確率1-P(A)で選択する
+
+行動Aを選択すると確率T(r1| t0, A)でr1に、1-T(r2| t0, A)でr2の報酬を受け取る
+
+行動Bを選択すると確率T(r3| t0, B)でr3に、1-T(r4| t0, B)でr4の報酬を受け取る
+
+## 2.1 実施内容
+
+各モデルから1つのパラメータ条件を選び、フィッティングする
+
+フィッティング結果に対して、それぞれのモデルのパラメータにおけるtraceplotと事後分布をプロットする
+
+フィッティング結果に対して、実際の選択確率と事後予測プロットの比較をする
+
+
+# 3.データの生成
+
+## 3.1データの生成に使用したコード (Python)
+
+<details>
+<summary>[データ生成のリンクはこちら](https://colab.research.google.com/drive/1hDCslydxCbMWNUY5WKksNuKylMJ8vX2Q?authuser=1)
+</summary>
+```
+# ver4
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from tqdm import tqdm
+import os, re
+from matplotlib.colors import to_hex
+from matplotlib import colormaps
+
+def fmt_dash(x, digits=1):
+    return str(round(x, digits)).replace('.', '-')
+
+def join_dash(seq):
+    return '-'.join(map(str, seq))
+
+T = 0.7
+r_base = [5, 5, 0, 15]
+t_max = 100
+n_agents = 50
+alpha_list = [0.1, 0.5, 0.9]
+beta_list = [0.1, 1.0, 1.9]
+
+baseline = (1 - T) * r_base[3]
+Q_init = [round(baseline, 1), round(baseline * 2, 1), round(baseline * 10, 1)]
+r_int = [round(baseline, 1), round(baseline * 2, 1), round(baseline * 10, 1)]
+
+agent_types = ["habit", "first_value_reward", "additional_internalized"]
+
+T_str = fmt_dash(T)
+rbase_str = join_dash(r_base)
+base_folder_name = f"T{T_str}_r{rbase_str}_{n_agents}agents"
+
+outdir = f"{base_folder_name}_rep1"
+csv_dir = os.path.join(outdir, "csv")
+png_dir = os.path.join(outdir, "png")
+os.makedirs(csv_dir, exist_ok=True)
+os.makedirs(png_dir, exist_ok=True)
+
+all_results = []
+
+temp_labels = []
+for agent_type in agent_types:
+    if agent_type == "first_value_reward":
+        for q in Q_init:
+            temp_labels.append(f"{agent_type}_Q_init{q}")
+    elif agent_type == "additional_internalized":
+        for r in r_int:
+            temp_labels.append(f"{agent_type}_r_int{r}")
+    else:
+        temp_labels.append("habit")
+
+habit_colors = {"habit": "#1f77b4"}
+fv_labels = sorted([lab for lab in temp_labels if "first_value_reward" in lab],
+                   key=lambda x: float(re.search(r"Q_init([0-9.]+)", x).group(1)))
+int_labels = sorted([lab for lab in temp_labels if "additional_internalized" in lab],
+                    key=lambda x: float(re.search(r"r_int([0-9.]+)", x).group(1)))
+
+fv_cmap = colormaps.get_cmap("Oranges")
+int_cmap = colormaps.get_cmap("YlGn")
+
+fv_colors = {lab: to_hex(fv_cmap(0.3 + 0.1 * i)) for i, lab in enumerate(fv_labels)}
+int_colors = {lab: to_hex(int_cmap(0.3 + 0.1 * i)) for i, lab in enumerate(int_labels)}
+palette_dict = {**habit_colors, **fv_colors, **int_colors}
+
+for agent_type in agent_types:
+    extra_param_list = Q_init if agent_type == "first_value_reward" else r_int if agent_type == "additional_internalized" else [None]
+    for extra_param in extra_param_list:
+        for alpha in tqdm(alpha_list, desc=f"{agent_type}, param={extra_param}"):
+            for beta in beta_list:
+                raw_data = []
+                pA_matrix = np.zeros((n_agents, t_max))
+                for n in range(n_agents):
+                    Q = np.zeros((2, t_max))
+                    pA = np.zeros(t_max)
+                    r1, r2, r3, r4 = r_base
+                    if agent_type == "first_value_reward":
+                        Q[0, 0] += extra_param
+                    elif agent_type == "additional_internalized":
+                        r1 += extra_param
+                        r2 += extra_param
+                    for t in range(t_max):
+                        pA[t] = 1 / (1 + np.exp(-beta * (Q[0, t] - Q[1, t])))
+                        if np.random.rand() < pA[t]:
+                            a = 0
+                            r = r1 if np.random.rand() < T else r2
+                        else:
+                            a = 1
+                            r = r3 if np.random.rand() < T else r4
+                        if t < t_max - 1:
+                            Q[a, t + 1] = Q[a, t] + alpha * (r - Q[a, t])
+                        raw_data.append({"ID": n, "round": t, "choice": a, "reward": r})
+                    pA_matrix[n, :] = pA
+                param_str = "na" if extra_param is None else fmt_dash(extra_param)
+                alpha_str = fmt_dash(alpha)
+                beta_str = fmt_dash(beta)
+                agent_label_str = agent_type.replace('_', '-')
+                base_filename = f"{agent_label_str}_p{param_str}_a{alpha_str}_b{beta_str}"
+                pd.DataFrame(raw_data).to_csv(f"{csv_dir}/{base_filename}.csv", index=False)
+                pA_mean = pA_matrix.mean(axis=0)
+                agent_label = f"{agent_type}_Q_init{extra_param}" if agent_type == "first_value_reward" else f"{agent_type}_r_int{extra_param}" if agent_type == "additional_internalized" else "habit"
+                color = palette_dict.get(agent_label, "#333333")
+                plt.figure(figsize=(5, 3))
+                plt.plot(pA_mean, label=agent_label, lw=2, color=color)
+                plt.ylim(0, 1.05)
+                plt.xlabel("Trial")
+                plt.ylabel("p(A)")
+                plt.title(f"{agent_type} | alpha={alpha}, beta={beta}")
+                plt.legend(loc='lower right')
+                plt.tight_layout()
+                plt.savefig(f"{png_dir}/{base_filename}.png", dpi=300)
+                plt.close()
+                for t in range(t_max):
+                    result = {"t": t, "pA_mean": pA_mean[t], "alpha": alpha, "beta": beta, "agent_type": agent_type}
+                    if agent_type == "first_value_reward":
+                        result["Q_init"] = extra_param
+                    elif agent_type == "additional_internalized":
+                        result["r_int"] = extra_param
+                    all_results.append(result)
+
+df = pd.DataFrame(all_results)
+df["agent_label"] = df["agent_type"]
+if "Q_init" in df.columns:
+    df.loc[df["agent_type"] == "first_value_reward", "agent_label"] += "_Q_init" + df["Q_init"].astype(str)
+if "r_int" in df.columns:
+    df.loc[df["agent_type"] == "additional_internalized", "agent_label"] += "_r_int" + df["r_int"].astype(str)
+
+sns.set(style="whitegrid")
+g = sns.FacetGrid(df, row="alpha", col="beta", hue="agent_label", margin_titles=True, height=2.5, palette=palette_dict)
+g.map_dataframe(sns.lineplot, x="t", y="pA_mean", lw=1.5, alpha=0.6)
+g.set(ylim=(0, 1.1))
+g.add_legend(title="Agent Type + Param")
+g.set_axis_labels("trials", "p(A) mean")
+g.set_titles(row_template="alpha = {row_name}", col_template="beta = {col_name}")
+g.tight_layout()
+g.savefig(f"{png_dir}/facet_all_summary.png", dpi=300)
+plt.close()
+```
+</details>
+
+## 3.2 生成データの確認 {.tabset .tabset-fade .tabset-pills}
+```{r seisei}
+cfg <- list(
+  agent_type = "first-value-reward",
+  T_val      = 0.7,
+  r_base     = c(5,5,0,18),
+  n_agents   = 50,
+  rep_idx    = 1,
+  extra_p    = 2.5,    
+  alphas     = c(0.1,0.5,0.9),
+  betas      = c(1.0,1.9)
+)
+```
+```{r seltutei}
+cfg_ev <- cfg
+cfg_ev$n_agents <- 5000
+
+plot_overlay_pA_grid <- function(cfg_list, label_list, root_list = c("data", "expected_value")) {
+  fstr <- function(x) gsub("\\.", "-", sprintf("%.1f", x))
+  
+  df_all_total <- list()
+  
+  for (i in seq_along(cfg_list)) {
+    cfg      <- cfg_list[[i]]
+    label    <- label_list[[i]]
+    root     <- root_list[[i]]
+    
+    folder   <- sprintf("T%s_r%s_%sagents_rep%s",
+                        fstr(cfg$T_val),
+                        paste(cfg$r_base, collapse = "-"),
+                        cfg$n_agents,
+                        cfg$rep_idx)
+    csv_dir  <- file.path(root, folder, "csv")
+    agent_cli <- cfg$agent_type
+    
+    df_list <- list()
+    
+    for (alpha in cfg$alphas) {
+      for (beta in cfg$betas) {
+        t_label <- paste0("p", fstr(cfg$extra_p))
+        fname   <- sprintf("%s_%s_a%s_b%s_pA.csv",
+                           agent_cli, t_label,
+                           fstr(alpha), fstr(beta))
+        fpath   <- file.path(csv_dir, fname)
+        
+        if (file.exists(fpath)) {
+          df <- readr::read_csv(fpath, show_col_types = FALSE) %>%
+            dplyr::mutate(
+              alpha = alpha,
+              beta  = beta,
+              sample_size = label
+            )
+          df_list[[length(df_list) + 1]] <- df
+        } else {
+          warning("ファイルが存在しません: ", fpath)
+        }
+      }
+    }
+    
+    df_all_total[[i]] <- dplyr::bind_rows(df_list)
+  }
+  
+  df_pA_all <- dplyr::bind_rows(df_all_total) %>%
+    dplyr::mutate(
+      alpha = factor(alpha, levels = sort(unique(cfg_list[[1]]$alphas))),
+      beta  = factor(beta,  levels = sort(unique(cfg_list[[1]]$betas))),
+      sample_size = factor(sample_size, levels = label_list)
+    )
+  
+    ggplot2::ggplot(df_pA_all, ggplot2::aes(x = trial, y = pA,
+                                          color = sample_size,
+                                          group = interaction(sample_size, alpha, beta))) +
+    ggplot2::geom_line(linewidth = 0.8) +
+    ggplot2::facet_grid(alpha ~ beta,
+                        labeller = ggplot2::label_both,
+                        switch = "y") +
+    ggplot2::coord_cartesian(ylim = c(0, 1)) +
+    ggplot2::theme_minimal(base_size = 13) +
+    ggplot2::theme(
+      strip.placement   = "outside",
+      strip.text.y.left = ggplot2::element_text(angle = 0),
+      panel.grid.minor  = ggplot2::element_blank()
+    ) +
+    ggplot2::scale_color_manual(
+      values = c("n=50" = "#FDB863",  
+                 "n=5000" = "#E66101")
+    ) +
+    ggplot2::labs(
+      title = " Aの選択確率　p(A)",
+      x     = "試行",
+      y     = "p(A)",
+      color = "人数"
+    )
+
+}
+
+```
+
+### 3.3.1 50人のデータ
+```{r hyouzi}
+plot_overlay_pA_grid(
+  cfg_list   = list(cfg, cfg_ev),
+  label_list = c("n=50", "n=5000"),
+  root_list  = c("data", "expected_value")
+)
+```
+
+# 4.フィッティング
+
+## 4.1 stanファイルの事前分布（数式）
+
+stanファイルは以下を使用した
+
+### 4.1.1 normal_2_2.stan
+
+\[
+\begin{aligned}
+\alpha &\sim \mathrm{Beta}(2, 2) \\
+\beta  &\sim \mathrm{LogNormal}(\log 1,\,0.5) \\
+Q_{\mathrm{init},1} &\sim \mathcal{N}(3.75,\,2)\;T[0,7.5] \\
+Q_{\mathrm{init},2} &= 0
+\end{aligned}
+\]
+
+
+```
+data {
+  int<lower=1> N;
+  int<lower=1> T;
+  array[N, T] int<lower=0, upper=1> choice;
+  array[N, T] real reward_A;
+  array[N, T] real reward_B;
+}
+
+parameters {
+  real<lower=0, upper=1> alpha;   
+  real<lower=0>          beta;    
+  real                   Q_init1; 
+}
+
+transformed parameters {
+  real Q_init2 = 0;               
+}
+
+model {
+  alpha   ~ beta(2, 2);
+  beta    ~ lognormal(log(1), 0.5);
+  Q_init1 ~ normal(3.75, 2) T[0, 7.5];
+
+  for (n in 1:N) {
+    vector[2] Q = rep_vector(0.0, 2);
+    Q[1] = Q_init1;
+    Q[2] = Q_init2;
+
+    for (t in 1:T) {
+      real pA = inv_logit(beta * (Q[1] - Q[2]));
+      choice[n, t] ~ bernoulli(pA);
+
+      int a = choice[n, t] + 1;
+      real r = (a == 1) ? reward_A[n, t] : reward_B[n, t];
+      Q[a] += alpha * (r - Q[a]);
+    }
+  }
+}
+
+generated quantities {
+  array[N, T] int<lower=0,upper=1> choice_rep;
+  array[N, T] real              pA_track;
+
+  for (n in 1:N) {
+    vector[2] Q = rep_vector(0.0, 2);
+    Q[1] = Q_init1;
+    Q[2] = Q_init2;
+
+    for (t in 1:T) {
+      real pA = inv_logit(beta * (Q[1] - Q[2]));
+      pA_track[n, t]   = pA;
+      choice_rep[n, t] = bernoulli_rng(pA);
+
+      int a = choice_rep[n, t] + 1;
+      real r = (a == 1) ? reward_A[n, t] : reward_B[n, t];
+      Q[a] += alpha * (r - Q[a]);
+    }
+  }
+}
+
+```
+
+## 4.2 フィッティングの実行
+
+<details>
+<summary>モデルのフィッティングのコード</summary>
+```{r test1,collapse=FALSE ,save_cmdstan_config=FALSE} 
+fmt_dash <- function(x) gsub("\\.", "-", sprintf("%.1f", x))
+join_dash <- function(v) paste(v, collapse = "-")
+
+param_grid <- expand.grid(
+  alpha = cfg$alphas,
+  beta  = cfg$betas
+) %>%
+  mutate(
+    a_str = fmt_dash(alpha),        
+    b_str = fmt_dash(beta),        
+    key   = paste0("a", a_str, "_b", b_str)  
+  )
+
+fit_model <- function(cfg, alpha, beta, stan_file = "first_value.stan") {
+
+  fmt_dash <- function(x) gsub("\\.", "-", sprintf("%.1f", x))
+  join_dash <- function(v) paste(v, collapse = "-")
+
+  folder   <- glue(
+    "T{fmt_dash(cfg$T_val)}_r{join_dash(cfg$r_base)}_{cfg$n_agents}agents_rep{cfg$rep_idx}"
+  )
+  agent_lbl <- gsub("_", "-", cfg$agent_type)
+  param_str <- if (is.na(cfg$extra_p)) "na" else fmt_dash(cfg$extra_p)
+  file_bas  <- glue("{agent_lbl}_p{param_str}_a{fmt_dash(alpha)}_b{fmt_dash(beta)}.csv")
+  csv_path  <- fs::path("data", folder, "csv", file_bas)
+  
+  if (!fs::file_exists(csv_path)) {
+    stop("CSV が見つかりません: ", csv_path)
+  }
+
+  df   <- read.csv(csv_path)
+  N    <- length(unique(df$ID))
+  Tt   <- max(df$round) + 1
+  stan_data <- list(
+    N        = N,
+    T        = Tt,
+    choice   = matrix(df$choice,   nrow = N, byrow = TRUE),
+    reward_A = matrix(ifelse(df$choice==0, df$reward, 0), nrow = N, byrow = TRUE),
+    reward_B = matrix(ifelse(df$choice==1, df$reward, 0), nrow = N, byrow = TRUE)
+  )
+  
+  mod <- cmdstan_model(stan_file)
+  fit <- mod$sample(
+    data          = stan_data,
+    chains        = 3,
+    iter_warmup   = 1000,
+    iter_sampling = 1000,
+    refresh       = 0
+  )
+  
+  return(fit)
+}
+```
+```{r list}
+fit_list <- param_grid %>%
+  mutate(fit = purrr::pmap(
+    list(alpha, beta),
+    ~ fit_model(cfg, ..1, ..2)
+  )) %>%
+  pull(fit)
+
+names(fit_list) <- param_grid$key
+
+```
+</details>
+
+```{r summary}
+alpha_beta_summary <- imap_dfr(
+  fit_list,
+  ~ .x$summary(variables = c("alpha", "beta","Q_init1")) %>%
+      as_tibble() %>%
+      mutate(pattern = .y) %>%                      
+      select(
+        pattern,
+        parameter = variable,
+        mean, median,
+        sd, mad,
+        q5, q95,
+        Rhat = rhat,
+        ESS_bulk = ess_bulk,
+        ESS_tail = ess_tail
+      ),
+  .id = NULL
+)
+
+knitr::kable(
+  alpha_beta_summary,
+  digits = 3,
+  caption = "summary"
+)
+
+```
+
+
+# 5.プロット
+
+## 5.1 traceplot 
+
+### 5.1.1 traceplot  {.tabset .tabset-fade .tabset-pills}
+
+5.1.1.1 データの読み込み
+```{r yomikomi1, cache=FALSE}
+param_list <- c("alpha", "beta","Q_init1")
+
+plot_trace_facet <- function(param_name, fit_list) {
+  trace_df <- dplyr::bind_rows(lapply(names(fit_list), function(model) {
+    draws_df <- posterior::as_draws_df(fit_list[[model]]$draws())
+    if (param_name %in% colnames(draws_df)) {
+      data.frame(
+        iteration = draws_df$.iteration,
+        chain     = factor(draws_df$.chain),
+        value     = draws_df[[param_name]],
+        model     = model
+      )
+    }
+  }))
+  
+  ggplot2::ggplot(trace_df, ggplot2::aes(x = iteration, y = value, color = chain)) +
+    ggplot2::geom_line(alpha = 0.8) +
+    ggplot2::facet_wrap(~model, ncol = 2) +
+    ggplot2::labs(title = paste("Traceplot of", param_name),
+                  x = "Iteration", y = param_name, color = "Chain") +
+    ggplot2::theme_minimal()
+}
+```
+
+#### 5.1.1.2 traceplot alpha
+```{r alpha1, cache=FALSE}
+plot_trace_facet("alpha", fit_list)
+```
+
+#### 5.1.1.3 traceplot beta
+```{r beta1,cache=FALSE}
+plot_trace_facet("beta", fit_list)
+```
+
+#### 5.1.1.4 traceplot Q_init1
+```{r Qinit1,cache=FALSE}
+plot_trace_facet("Q_init1", fit_list)
+```
+
+## 5.2事後分布
+
+### 5.2.0 関数の作成
+```{r load1, cache=FALSE}
+plot_density_facet <- function(param_name, fit_list, y_max = NULL) {
+  dens_df <- bind_rows(lapply(names(fit_list), function(model) {
+    draws_df <- as_draws_df(fit_list[[model]]$draws(format = "df"))
+    if (param_name %in% colnames(draws_df)) {
+      data.frame(
+        value = draws_df[[param_name]],
+        chain = as.factor(draws_df$.chain),
+        model = model
+      )
+    } else {
+      NULL
+    }
+  }))
+  
+  p <- ggplot(dens_df, aes(x = value, color = chain, fill = chain)) +
+    geom_density(alpha = 0.3) +
+    facet_wrap(~model, ncol = 2) +
+    labs(title = paste("Posterior distribution of", param_name),
+         x = param_name, y = "Density", color = "Chain", fill = "Chain") +
+    theme_minimal()
+  
+  if (!is.null(y_max)) {
+    p <- p + coord_cartesian(ylim = c(0, y_max))
+  }
+
+  return(p)
+}
+```
+
+### 5.2.1事後分布 habitモデル {.tabset .tabset-fade .tabset-pills}
+
+#### 5.2.1.1 alpha
+```{r zigoalpha1, cache=FALSE}
+plot_density_facet("alpha", fit_list, y_max = 50)
+```
+
+#### 5.2.1.2 beta
+```{r zigobeta1, cache=FALSE}
+plot_density_facet("beta", fit_list, y_max = 10)
+``` 
+
+#### 5.2.1.3 Q_init1
+```{r zigoQ_init1, cache=FALSE}
+plot_density_facet("Q_init1", fit_list, y_max = 10)
+``` 
+
+
+## 5.3 実際の選択確率
+
+5.3.1 前処理 
+```{r syori, cache=FALSE}
+fstr <- function(x) gsub("\\.", "-", sprintf("%.1f", x))
+
+folder_name <- sprintf("data/T%s_r%s_%sagents_rep%s",
+  fstr(cfg$T_val),
+  paste(cfg$r_base, collapse = "-"),
+  cfg$n_agents,
+  cfg$rep_idx
+)
+csv_dir <- file.path(folder_name, "csv")
+
+df_all <- list()
+
+for (alpha in cfg$alphas) {
+  for (beta in cfg$betas) {
+    t_label   <- paste0("p", fstr(cfg$extra_p))
+    file_name <- sprintf("%s_%s_a%s_b%s_pA.csv",
+      cfg$agent_type,  
+      t_label,
+      fstr(alpha),
+      fstr(beta)
+    )
+    file_path <- file.path(csv_dir, file_name)
+    if (file.exists(file_path)) {
+      raw <- readr::read_csv(file_path, show_col_types = FALSE)
+      df_all[[length(df_all) + 1]] <- raw %>%
+        dplyr::mutate(alpha = alpha, beta = beta)
+    } else {
+      warning("ファイルが存在しません: ", file_path)
+    }
+  }
+}
+
+df_pA_all <- dplyr::bind_rows(df_all) %>%
+  dplyr::mutate(
+    alpha = factor(alpha, levels = sort(unique(cfg$alphas))),
+    beta  = factor(beta,  levels = sort(unique(cfg$betas)))
+  )
+
+ggplot2::ggplot(df_pA_all, ggplot2::aes(x = trial, y = pA, group = interaction(alpha, beta))) +
+  ggplot2::geom_line(color = "orange", linewidth = 0.7) +
+  ggplot2::facet_grid(alpha ~ beta, labeller = ggplot2::label_both, switch = "y") +
+  ggplot2::coord_cartesian(ylim = c(0, 1)) +
+  ggplot2::theme_minimal(base_size = 13) +
+  ggplot2::theme(
+    strip.placement   = "outside",
+    strip.text.y.left = ggplot2::element_text(angle = 0),
+    panel.grid.minor  = ggplot2::element_blank()
+  ) +
+  ggplot2::labs(
+    title = "全 α×β 条件における 平均選択確率 p(A)",
+    x     = "試行",
+    y     = "p(A)"
+  )
+
+```
+
+## 5.4 事後予測プロット
+
+### 5.4.1 事後予測 
+```{r yosoku1, cache=FALSE}
+df_ppc_all <- imap_dfr(fit_list, function(fit, pat) {
+
+  if (!"pA_track" %in% fit$metadata()$stan_variables) return(NULL)
+  
+  arr    <- fit$draws("pA_track", format = "draws_array")
+  names3 <- dimnames(arr)[[3]]
+  idx    <- str_match(names3, "pA_track\\[(\\d+),(\\d+)\\]")
+  Tt     <- max(as.integer(idx[,3]))
+
+  pA_summary <- t(sapply(seq_len(Tt), function(t) {
+    sel <- which(idx[,3] == t)
+    x   <- as.vector(arr[,, sel, drop = FALSE])
+    c(
+      mean  = mean(x),
+      lower = quantile(x, 0.025),
+      upper = quantile(x, 0.975)
+    )
+  }))
+  colnames(pA_summary) <- c("mean","lower","upper")
+
+  m     <- str_match(pat, "^a([0-9-]+)_b([0-9-]+)$")
+  alpha <- as.numeric(str_replace(m[2], "-", "."))
+  beta  <- as.numeric(str_replace(m[3], "-", "."))
+
+  tibble(
+    trial = seq_len(Tt) - 1,
+    pA    = pA_summary[,"mean"],
+    lower = pA_summary[,"lower"],
+    upper = pA_summary[,"upper"],
+    alpha = factor(alpha, levels = sort(cfg$alphas)),
+    beta  = factor(beta,  levels = sort(cfg$betas))
+  )
+})
+
+ggplot(df_ppc_all, aes(trial, pA)) +
+  geom_ribbon(aes(ymin = lower, ymax = upper),
+              fill = "orange", alpha = 0.2) +
+  geom_line(color = "orange", size = 0.7) +
+  facet_grid(alpha ~ beta, labeller = label_both, switch = "y") +
+  coord_cartesian(ylim = c(0,1)) +
+  theme_minimal() +
+  theme(
+    strip.placement   = "outside",
+    strip.text.y.left = element_text(angle = 0),
+    panel.grid.minor  = element_blank(),
+    legend.position   = "none"
+  ) +
+  labs(
+    title = "Posterior predictive P(A)",
+    x     = "Trial",
+    y     = "Predicted P(A)"
+  )
+
+
+```
+
+
+## 5.5 実際の選択確率と事後予測プロットの比較
+
+```{r compare_stan1, cache=FALSE}
+ggplot() +
+  geom_ribbon(
+    data = df_ppc_all,
+    aes(x = trial, ymin = lower, ymax = upper),
+    fill  = "orange", alpha = 0.2
+  ) +
+
+  geom_line(
+    data = df_ppc_all,
+    aes(x = trial, y = pA),
+    color = "orange", size = 0.7
+  ) +
+
+  geom_line(
+    data = df_pA_all,
+    aes(x = trial, y = pA, group = interaction(alpha, beta)),
+    color = "black", size = 0.6, alpha = 0.6
+  ) +
+
+  facet_grid(alpha ~ beta, labeller = label_both, switch = "y") +
+
+  coord_cartesian(ylim = c(0, 1)) +
+  theme_minimal(base_size = 13) +
+  theme(
+    strip.placement     = "outside",
+    strip.text.y.left   = element_text(angle = 0),
+    panel.grid.minor    = element_blank(),
+    legend.position     = "none"
+  ) +
+  labs(
+    title = "実測値（黒） vs. Posterior predictive P(A)（青）",
+    x     = "Trial",
+    y     = "P(A)"
+  )
+
+```
+
